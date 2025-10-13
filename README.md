@@ -1,78 +1,122 @@
-# CosmosDB and SQL Server API with Clean Architecture
+# Clean Architecture Solution - .NET 8
 
-## Architecture Overview
+## Overview
+This is a .NET 8 solution implementing Clean Architecture principles with support for multiple data sources.
 
-This project implements Clean Architecture with:
-- **Domain Layer**: Core entities and domain logic
-- **Application Layer**: Generic interfaces (IDataRepository) and business logic
-- **Infrastructure Layer**: Concrete implementations for Cosmos DB and SQL Server
-- **API Layer**: RESTful endpoints
-
-## Project Structure
+## Solution Structure
 
 ```
-src/
-├── Domain/                     # Core entities, no dependencies
-├── Application/                # Interfaces, DTOs, business logic
-├── Infrastructure/             # Data access implementations
-│   ├── CosmosDB/              # Cosmos DB repository
-│   └── SqlServer/             # SQL Server repository with EF Core
-└── API/                       # Web API controllers
+CleanArchitecture.sln
+├── src/
+│   ├── Domain/              # Core business entities and logic
+│   │   └── Entities/       # Domain entities
+│   ├── Application/         # Application business rules
+│   │   └── Interfaces/     # Repository interfaces
+│   ├── Infrastructure/      # External concerns (Database, APIs)
+│   │   ├── Persistence/    # Database implementations
+│   │   └── Services/       # External services
+│   └── API/                # Web API presentation layer
+│       ├── Controllers/    # API endpoints
+│       └── Program.cs      # Application entry point
 ```
 
-## Prerequisites
+## Clean Architecture Layers
 
+### 1. Domain Layer (Core)
+- **Purpose**: Contains enterprise business rules and entities
+- **Dependencies**: None (completely independent)
+- **Contents**:
+  - Entities
+  - Value Objects
+  - Domain Events
+  - Interfaces (optional)
+
+### 2. Application Layer
+- **Purpose**: Contains application business rules
+- **Dependencies**: Domain layer only
+- **Contents**:
+  - Interfaces (IRepository, IService)
+  - DTOs
+  - Application Services
+  - Use Cases/Commands/Queries
+
+### 3. Infrastructure Layer
+- **Purpose**: Implements interfaces defined in Application layer
+- **Dependencies**: Domain and Application layers
+- **Contents**:
+  - Database Context (EF Core)
+  - Repository Implementations
+  - External API clients
+  - File System access
+  - Email services
+
+### 4. API/Presentation Layer
+- **Purpose**: User interface and API endpoints
+- **Dependencies**: Application and Infrastructure layers
+- **Contents**:
+  - Controllers
+  - Middleware
+  - Filters
+  - Program.cs / Startup configuration
+
+## Dependency Flow
+
+```
+API --> Application --> Domain
+ |          |
+ v          v
+Infrastructure
+```
+
+## Key Principles
+
+1. **Dependency Inversion**: High-level modules don't depend on low-level modules
+2. **Separation of Concerns**: Each layer has a specific responsibility
+3. **Testability**: Easy to unit test due to dependency injection
+4. **Independence**: Business logic is independent of frameworks and UI
+
+## Getting Started
+
+### Prerequisites
 - .NET 8 SDK
-- Azure Cosmos DB account
-- SQL Server instance
+- Visual Studio 2022 or VS Code
 
-## Setup Instructions
-
-1. Create the solution and projects:
+### Build the Solution
 ```bash
-dotnet new sln -n CosmosDbSqlApi
-
-# Create projects
-dotnet new classlib -n Domain -o src/Domain
-dotnet new classlib -n Application -o src/Application
-dotnet new classlib -n Infrastructure -o src/Infrastructure
-dotnet new webapi -n API -o src/API
-
-# Add projects to solution
-dotnet sln add src/Domain/Domain.csproj
-dotnet sln add src/Application/Application.csproj
-dotnet sln add src/Infrastructure/Infrastructure.csproj
-dotnet sln add src/API/API.csproj
+dotnet restore
+dotnet build
 ```
 
-2. Set up project references:
+### Run the API
 ```bash
-cd src/Application && dotnet add reference ../Domain/Domain.csproj
-cd ../Infrastructure && dotnet add reference ../Domain/Domain.csproj ../Application/Application.csproj
-cd ../API && dotnet add reference ../Application/Application.csproj ../Infrastructure/Infrastructure.csproj
+cd src/API
+dotnet run
 ```
 
-3. Install required NuGet packages:
-```bash
-# Infrastructure project
-cd src/Infrastructure
-dotnet add package Microsoft.EntityFrameworkCore.SqlServer
-dotnet add package Microsoft.EntityFrameworkCore.Tools
-dotnet add package Microsoft.Azure.Cosmos
+The API will be available at:
+- HTTPS: https://localhost:7xxx
+- HTTP: http://localhost:5xxx
+- Swagger: https://localhost:7xxx/swagger
 
-# API project
-cd ../API
-dotnet add package Microsoft.EntityFrameworkCore.Design
-```
+## Project References
 
-4. Update appsettings.json with your connection strings
+- **Domain**: No dependencies
+- **Application**: References Domain
+- **Infrastructure**: References Domain and Application
+- **API**: References Application and Infrastructure
 
-5. Run migrations for SQL Server:
-```bash
-dotnet ef migrations add InitialCreate --project src/Infrastructure --startup-project src/API
-dotnet ef database update --project src/Infrastructure --startup-project src/API
-```
+## Next Steps
 
-## Configuration
+1. Add your domain entities in `src/Domain/Entities`
+2. Define repository interfaces in `src/Application/Interfaces`
+3. Implement repositories in `src/Infrastructure`
+4. Create controllers in `src/API/Controllers`
+5. Configure dependency injection in `Program.cs`
 
-See appsettings.json for connection string configuration.
+## Best Practices
+
+- Keep Domain layer pure (no external dependencies)
+- Use interfaces for all external dependencies
+- Implement repository pattern for data access
+- Use DTOs for data transfer between layers
+- Apply SOLID principles throughout

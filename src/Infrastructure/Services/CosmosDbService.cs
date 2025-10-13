@@ -1,20 +1,22 @@
+using Application.Interfaces;
+using Infrastructure.CosmosDB;
 using Microsoft.Azure.Cosmos;
 
-namespace Infrastructure.CosmosDB;
+namespace Infrastructure.Services;
 
 /// <summary>
-/// Singleton service for managing Cosmos DB client
-/// Registered as Singleton in DI container
+/// Implementation of Cosmos DB service
+/// Registered as Singleton in DI container for connection reuse
 /// </summary>
-public class CosmosDbService
+public class CosmosDbService : ICosmosDbService
 {
     private readonly CosmosClient _client;
     private readonly string _databaseName;
 
     public CosmosDbService(CosmosClient client, CosmosDbSettings settings)
     {
-        _client = client;
-        _databaseName = settings.DatabaseName;
+        _client = client ?? throw new ArgumentNullException(nameof(client));
+        _databaseName = settings?.DatabaseName ?? throw new ArgumentNullException(nameof(settings));
     }
 
     public CosmosClient Client => _client;
@@ -23,7 +25,12 @@ public class CosmosDbService
     public Database GetDatabase() => _client.GetDatabase(_databaseName);
 
     public Container GetContainer(string containerName)
-        => _client.GetDatabase(_databaseName).GetContainer(containerName);
+    {
+        if (string.IsNullOrWhiteSpace(containerName))
+            throw new ArgumentException("Container name cannot be null or empty", nameof(containerName));
+
+        return _client.GetDatabase(_databaseName).GetContainer(containerName);
+    }
 
     public async Task<Database> CreateDatabaseIfNotExistsAsync(int? throughput = null)
     {
@@ -38,6 +45,12 @@ public class CosmosDbService
         string partitionKeyPath,
         int? throughput = null)
     {
+        if (string.IsNullOrWhiteSpace(containerName))
+            throw new ArgumentException("Container name cannot be null or empty", nameof(containerName));
+
+        if (string.IsNullOrWhiteSpace(partitionKeyPath))
+            throw new ArgumentException("Partition key path cannot be null or empty", nameof(partitionKeyPath));
+
         var database = GetDatabase();
         var response = await database.CreateContainerIfNotExistsAsync(
             containerName,

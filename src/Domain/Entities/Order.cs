@@ -1,8 +1,5 @@
 namespace Domain.Entities;
 
-/// <summary>
-/// Example entity - Order
-/// </summary>
 public class Order : BaseEntity
 {
     public string CustomerId { get; set; } = string.Empty;
