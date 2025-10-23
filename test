@@ -1,0 +1,83 @@
+using System;
+using System.Net;
+using System.ServiceModel;
+using System.ServiceModel.Channels;
+using System.ServiceModel.Dispatcher;
+using System.Web;
+
+public class CsrfHeaderValidator : IDispatchMessageInspector
+{
+    private readonly string allowedOrigin = "https://yourdomain.com";  // change this
+
+    public object AfterReceiveRequest(ref Message request, IClientChannel channel, InstanceContext instanceContext)
+    {
+        var http = request.Properties[HttpRequestMessageProperty.Name] as HttpRequestMessageProperty;
+        if (http != null)
+        {
+            var origin = http.Headers["Origin"];
+            var referer = http.Headers["Referer"];
+
+            if (!IsValidOrigin(origin) && !IsValidOrigin(referer))
+            {
+                throw new WebFaultException<string>("Potential CSRF detected", HttpStatusCode.Forbidden);
+            }
+        }
+        return null;
+    }
+
+    public void BeforeSendReply(ref Message reply, object correlationState) { }
+
+    private bool IsValidOrigin(string headerValue)
+    {
+        if (string.IsNullOrEmpty(headerValue)) return false;
+        return headerValue.StartsWith(allowedOrigin, StringComparison.OrdinalIgnoreCase);
+    }
+}
+
+
+using System.ServiceModel.Description;
+using System.ServiceModel.Dispatcher;
+
+public class CsrfHeaderBehavior : BehaviorExtensionElement, IEndpointBehavior
+{
+    public override Type BehaviorType => typeof(CsrfHeaderBehavior);
+    protected override object CreateBehavior() => new CsrfHeaderBehavior();
+
+    public void AddBindingParameters(ServiceEndpoint endpoint, BindingParameterCollection bindingParameters) { }
+    public void ApplyClientBehavior(ServiceEndpoint endpoint, ClientRuntime clientRuntime) { }
+    public void ApplyDispatchBehavior(ServiceEndpoint endpoint, EndpointDispatcher endpointDispatcher)
+    {
+        endpointDispatcher.DispatchRuntime.MessageInspectors.Add(new CsrfHeaderValidator());
+    }
+    public void Validate(ServiceEndpoint endpoint) { }
+}
+
+
+<extensions>
+  <behaviorExtensions>
+    <add name="csrfHeaderBehavior"
+         type="YourNamespace.CsrfHeaderBehavior, YourAssemblyName" />
+  </behaviorExtensions>
+</extensions>
+
+<behaviors>
+  <endpointBehaviors>
+    <behavior name="CsrfCheck">
+      <csrfHeaderBehavior />
+    </behavior>
+  </endpointBehaviors>
+</behaviors>
+
+
+<services>
+  <service name="YourNamespace.YourService">
+    <endpoint address=""
+              binding="webHttpBinding"
+              behaviorConfiguration="CsrfCheck"
+              contract="YourNamespace.IYourService" />
+  </service>
+</services>
+
+
+
+
