@@ -1,0 +1,185 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.ServiceModel.Web;
+using System.Web;
+using System.Web.Security;
+using System.Diagnostics;
+
+namespace YourNamespace.Security
+{
+    public abstract class SecureServiceBase
+    {
+        private static readonly string[] StateChangingMethods = { "POST", "PUT", "PATCH", "DELETE" };
+        // Add any public origins you legitimately accept (including proxies' public host)
+        private static readonly string[] AllowedOrigins =
+            { "https://yourdomain.com", "https://staging.yourdomain.com", "http://localhost" };
+
+        private const string CsrfSessionKey = "__CSRF_TOKEN";
+        private const string CsrfNonceListKey = "__CSRF_NONCES";
+        private const string DoubleSubmitCookieName = "XSRF-TOKEN"; // readable cookie for double-submit
+
+        /// <summary>
+        /// Call this from pages that render forms or on login to ensure a token exists.
+        /// This sets a non-HttpOnly cookie (double-submit pattern) so JS or forms can read it.
+        /// </summary>
+        protected void EnsureCsrfTokenIssued()
+        {
+            var ctx = HttpContext.Current;
+            if (ctx == null) return;
+
+            if (ctx.Session[CsrfSessionKey] == null)
+            {
+                string token = Guid.NewGuid().ToString("N");
+                ctx.Session[CsrfSessionKey] = token;
+            }
+
+            // ensure cookie present (cookie must be readable by JS/client for double-submit)
+            var cookie = ctx.Request.Cookies[DoubleSubmitCookieName];
+            var tokenInSession = ctx.Session[CsrfSessionKey] as string;
+            if (cookie == null || cookie.Value != tokenInSession)
+            {
+                var respCookie = new HttpCookie(DoubleSubmitCookieName, tokenInSession)
+                {
+                    HttpOnly = false, // must be readable by client
+                    Secure = ctx.Request.IsSecureConnection,
+                    Path = "/"
+                };
+                // SameSite cannot be set in older frameworks via constructor; set via response header if needed
+                ctx.Response.Cookies.Set(respCookie);
+            }
+        }
+
+        /// <summary>
+        /// Use at beginning of each state-changing operation (or call centrally in a dispatcher).
+        /// </summary>
+        protected void ValidateCsrfOrThrow(string possibleTokenFromParam = null, bool requireOneTimeNonce = false)
+        {
+            var ctx = HttpContext.Current;
+            if (ctx == null) return;
+
+            var httpReq = ctx.Request;
+            var method = httpReq.HttpMethod?.ToUpperInvariant() ?? "GET";
+
+            // Only validate for state-changing HTTP methods
+            if (!StateChangingMethods.Contains(method)) return;
+
+            // If no session/auth cookie, it's likely not a browser-authenticated request — treat as safe for CSRF (or require auth)
+            bool hasAuthCookie = httpReq.Cookies[FormsAuthentication.FormsCookieName] != null;
+            bool hasSessionCookie = httpReq.Cookies["ASP.NET_SessionId"] != null;
+            if (!hasAuthCookie && !hasSessionCookie)
+            {
+                // If you want to be strict, throw here.
+                // throw new WebFaultException<string>("Authentication required", HttpStatusCode.Unauthorized);
+                return;
+            }
+
+            // 1) Check header token (preferred: client sets X-CSRF-Token header)
+            string headerToken = httpReq.Headers["X-CSRF-Token"];
+            string sessionToken = ctx.Session[CsrfSessionKey] as string;
+            if (!string.IsNullOrEmpty(headerToken) && !string.IsNullOrEmpty(sessionToken)
+                && string.Equals(headerToken, sessionToken, StringComparison.Ordinal))
+            {
+                // optionally consume nonce if required below
+                if (requireOneTimeNonce) ValidateAndConsumeOneTimeNonce(ctx, possibleTokenFromParam);
+                return;
+            }
+
+            // 2) Check param token (if form includes token param)
+            if (!string.IsNullOrEmpty(possibleTokenFromParam) && !string.IsNullOrEmpty(sessionToken)
+                && string.Equals(possibleTokenFromParam, sessionToken, StringComparison.Ordinal))
+            {
+                if (requireOneTimeNonce) ValidateAndConsumeOneTimeNonce(ctx, possibleTokenFromParam);
+                return;
+            }
+
+            // 3) Double-submit cookie: cookie token must match header or param token
+            string cookieToken = httpReq.Cookies[DoubleSubmitCookieName]?.Value;
+            if (!string.IsNullOrEmpty(cookieToken)
+                && (!string.IsNullOrEmpty(headerToken) && cookieToken == headerToken
+                    || !string.IsNullOrEmpty(possibleTokenFromParam) && cookieToken == possibleTokenFromParam))
+            {
+                if (requireOneTimeNonce) ValidateAndConsumeOneTimeNonce(ctx, cookieToken);
+                return;
+            }
+
+            // 4) Fallback checks: Origin/Referer or X-Requested-With (less secure)
+            var origin = httpReq.Headers["Origin"];
+            var referer = httpReq.Headers["Referer"];
+            var xrw = httpReq.Headers["X-Requested-With"];
+            if (IsAllowedOrigin(origin) || IsAllowedOrigin(referer) || string.Equals(xrw, "XMLHttpRequest", StringComparison.OrdinalIgnoreCase))
+            {
+                // allowed by fallback (useful for legacy clients), but log for audit
+                Trace.TraceInformation($"[CSRF-FALLBACK-ALLOW] method={method} path={httpReq.RawUrl} origin={origin} referer={referer} xrw={xrw}");
+                if (requireOneTimeNonce) ValidateAndConsumeOneTimeNonce(ctx, possibleTokenFromParam);
+                return;
+            }
+
+            // If we reach here, reject
+            Trace.TraceWarning($"[CSRF-FAILED] method={method} path={httpReq.RawUrl} origin={origin ?? "-"} referer={referer ?? "-"} headerToken={(headerToken ?? "-")}");
+            throw new WebFaultException<string>("CSRF validation failed", HttpStatusCode.Forbidden);
+        }
+
+        private bool IsAllowedOrigin(string header)
+        {
+            if (string.IsNullOrEmpty(header)) return false;
+
+            // header may include path (referer)
+            foreach (var allowed in AllowedOrigins)
+            {
+                if (header.StartsWith(allowed, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        // One-time nonce logic: store a small list in session and consume on use
+        protected string IssueOneTimeNonce()
+        {
+            var ctx = HttpContext.Current;
+            if (ctx == null) return null;
+            var nonce = Guid.NewGuid().ToString("N");
+            var set = ctx.Session[CsrfNonceListKey] as Queue<string>;
+            if (set == null)
+            {
+                set = new Queue<string>();
+                ctx.Session[CsrfNonceListKey] = set;
+            }
+
+            // keep a small size to avoid session bloat
+            if (set.Count > 20) set.Dequeue();
+            set.Enqueue(nonce);
+            return nonce;
+        }
+
+        private void ValidateAndConsumeOneTimeNonce(HttpContext ctx, string providedNonce)
+        {
+            if (string.IsNullOrEmpty(providedNonce))
+            {
+                throw new WebFaultException<string>("Missing nonce", HttpStatusCode.Forbidden);
+            }
+
+            var q = ctx.Session[CsrfNonceListKey] as Queue<string>;
+            if (q == null || q.Count == 0)
+            {
+                throw new WebFaultException<string>("Invalid nonce", HttpStatusCode.Forbidden);
+            }
+
+            // Accept only if present and then remove everything up to and including that token
+            if (!q.Contains(providedNonce))
+            {
+                throw new WebFaultException<string>("Invalid or used nonce", HttpStatusCode.Forbidden);
+            }
+
+            // consume tokens up to providedNonce (simple consume strategy)
+            var newQ = new Queue<string>();
+            while (q.Count > 0)
+            {
+                var t = q.Dequeue();
+                if (t == providedNonce) break; // stop consuming after found
+            }
+            ctx.Session[CsrfNonceListKey] = q; // remaining nonces
+        }
+    }
+}
