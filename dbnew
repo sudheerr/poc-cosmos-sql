@@ -1,0 +1,999 @@
+// ============================================================
+// .NET 8 COSMOS DB - MULTIPLE DATABASES GUIDE
+// Dependency Injection & Configuration Patterns
+// ============================================================
+
+// Install Package: Microsoft.Azure.Cosmos
+
+// ============================================================
+// 1. CONFIGURATION - appsettings.json
+// ============================================================
+
+/*
+{
+  "CosmosDb": {
+    "Account": "https://your-account.documents.azure.com:443/",
+    "Key": "your-primary-key==",
+    "Databases": {
+      "Orders": {
+        "DatabaseName": "OrdersDB",
+        "Containers": {
+          "Orders": "orders-container",
+          "OrderHistory": "order-history-container"
+        }
+      },
+      "Products": {
+        "DatabaseName": "ProductsDB",
+        "Containers": {
+          "Products": "products-container",
+          "Inventory": "inventory-container"
+        }
+      },
+      "Users": {
+        "DatabaseName": "UsersDB",
+        "Containers": {
+          "Users": "users-container",
+          "Profiles": "profiles-container"
+        }
+      }
+    }
+  }
+}
+*/
+
+
+// ============================================================
+// 2. STRONGLY-TYPED CONFIGURATION CLASSES
+// ============================================================
+
+public class CosmosDbSettings
+{
+    public string Account { get; set; } = string.Empty;
+    public string Key { get; set; } = string.Empty;
+    public Dictionary<string, DatabaseSettings> Databases { get; set; } = new();
+}
+
+public class DatabaseSettings
+{
+    public string DatabaseName { get; set; } = string.Empty;
+    public Dictionary<string, string> Containers { get; set; } = new();
+}
+
+
+// ============================================================
+// 3. SERVICE REGISTRATION IN PROGRAM.CS
+// ============================================================
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Register CosmosDB settings
+builder.Services.Configure<CosmosDbSettings>(
+    builder.Configuration.GetSection("CosmosDb"));
+
+// Register CosmosClient as Singleton (important for performance)
+builder.Services.AddSingleton<CosmosClient>(serviceProvider =>
+{
+    var cosmosSettings = builder.Configuration.GetSection("CosmosDb").Get<CosmosDbSettings>();
+    
+    return new CosmosClient(
+        cosmosSettings.Account,
+        cosmosSettings.Key,
+        new CosmosClientOptions
+        {
+            SerializerOptions = new CosmosSerializationOptions
+            {
+                PropertyNamingPolicy = CosmosPropertyNamingPolicy.CamelCase
+            },
+            ConnectionMode = ConnectionMode.Direct,
+            MaxRetryAttemptsOnRateLimitedRequests = 3,
+            MaxRetryWaitTimeOnRateLimitedRequests = TimeSpan.FromSeconds(10),
+            ApplicationName = "MyWebAPI",
+            RequestTimeout = TimeSpan.FromSeconds(30)
+        });
+});
+
+// Register repositories for each database
+builder.Services.AddScoped<IOrderRepository, OrderRepository>();
+builder.Services.AddScoped<IProductRepository, ProductRepository>();
+builder.Services.AddScoped<IUserRepository, UserRepository>();
+
+
+// ============================================================
+// 4. BASE REPOSITORY PATTERN
+// ============================================================
+
+public interface ICosmosRepository<T> where T : class
+{
+    Task<T?> GetByIdAsync(string id, string partitionKey);
+    Task<IEnumerable<T>> GetAllAsync();
+    Task<IEnumerable<T>> QueryAsync(string query);
+    Task<IEnumerable<T>> QueryAsync(QueryDefinition queryDefinition);
+    Task<T> CreateAsync(T item, string partitionKey);
+    Task<T> UpdateAsync(string id, T item, string partitionKey);
+    Task<T> UpsertAsync(T item, string partitionKey);
+    Task DeleteAsync(string id, string partitionKey);
+}
+
+public abstract class CosmosRepository<T> : ICosmosRepository<T> where T : class
+{
+    protected readonly Container _container;
+    protected readonly ILogger _logger;
+
+    protected CosmosRepository(
+        CosmosClient cosmosClient,
+        string databaseName,
+        string containerName,
+        ILogger logger)
+    {
+        _container = cosmosClient.GetContainer(databaseName, containerName);
+        _logger = logger;
+    }
+
+    public async Task<T?> GetByIdAsync(string id, string partitionKey)
+    {
+        try
+        {
+            var response = await _container.ReadItemAsync<T>(
+                id,
+                new PartitionKey(partitionKey));
+            
+            _logger.LogInformation("Retrieved item {Id}, RU: {RU}", id, response.RequestCharge);
+            return response.Resource;
+        }
+        catch (CosmosException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            _logger.LogWarning("Item with id {Id} not found", id);
+            return null;
+        }
+    }
+
+    public async Task<IEnumerable<T>> GetAllAsync()
+    {
+        var query = _container.GetItemQueryIterator<T>();
+        var results = new List<T>();
+        double totalRU = 0;
+
+        while (query.HasMoreResults)
+        {
+            var response = await query.ReadNextAsync();
+            results.AddRange(response);
+            totalRU += response.RequestCharge;
+        }
+
+        _logger.LogInformation("Retrieved {Count} items, Total RU: {RU}", results.Count, totalRU);
+        return results;
+    }
+
+    public async Task<IEnumerable<T>> QueryAsync(string queryString)
+    {
+        var query = _container.GetItemQueryIterator<T>(new QueryDefinition(queryString));
+        var results = new List<T>();
+        double totalRU = 0;
+
+        while (query.HasMoreResults)
+        {
+            var response = await query.ReadNextAsync();
+            results.AddRange(response);
+            totalRU += response.RequestCharge;
+        }
+
+        _logger.LogInformation("Query returned {Count} items, Total RU: {RU}", results.Count, totalRU);
+        return results;
+    }
+
+    public async Task<IEnumerable<T>> QueryAsync(QueryDefinition queryDefinition)
+    {
+        var query = _container.GetItemQueryIterator<T>(queryDefinition);
+        var results = new List<T>();
+        double totalRU = 0;
+
+        while (query.HasMoreResults)
+        {
+            var response = await query.ReadNextAsync();
+            results.AddRange(response);
+            totalRU += response.RequestCharge;
+        }
+
+        _logger.LogInformation("Query returned {Count} items, Total RU: {RU}", results.Count, totalRU);
+        return results;
+    }
+
+    public async Task<T> CreateAsync(T item, string partitionKey)
+    {
+        var response = await _container.CreateItemAsync(
+            item,
+            new PartitionKey(partitionKey));
+        
+        _logger.LogInformation("Created item, RU: {RU}", response.RequestCharge);
+        return response.Resource;
+    }
+
+    public async Task<T> UpdateAsync(string id, T item, string partitionKey)
+    {
+        var response = await _container.ReplaceItemAsync(
+            item,
+            id,
+            new PartitionKey(partitionKey));
+        
+        _logger.LogInformation("Updated item {Id}, RU: {RU}", id, response.RequestCharge);
+        return response.Resource;
+    }
+
+    public async Task<T> UpsertAsync(T item, string partitionKey)
+    {
+        var response = await _container.UpsertItemAsync(
+            item,
+            new PartitionKey(partitionKey));
+        
+        _logger.LogInformation("Upserted item, RU: {RU}", response.RequestCharge);
+        return response.Resource;
+    }
+
+    public async Task DeleteAsync(string id, string partitionKey)
+    {
+        var response = await _container.DeleteItemAsync<T>(
+            id,
+            new PartitionKey(partitionKey));
+        
+        _logger.LogInformation("Deleted item {Id}, RU: {RU}", id, response.RequestCharge);
+    }
+}
+
+
+// ============================================================
+// 5. ORDER REPOSITORY (OrdersDB)
+// ============================================================
+
+public interface IOrderRepository : ICosmosRepository<Order>
+{
+    Task<IEnumerable<Order>> GetOrdersByUserIdAsync(string userId);
+    Task<IEnumerable<Order>> GetOrdersByStatusAsync(string status);
+    Task<IEnumerable<Order>> GetOrdersByDateRangeAsync(DateTime startDate, DateTime endDate);
+}
+
+public class OrderRepository : CosmosRepository<Order>, IOrderRepository
+{
+    public OrderRepository(
+        CosmosClient cosmosClient,
+        IOptions<CosmosDbSettings> settings,
+        ILogger<OrderRepository> logger)
+        : base(
+            cosmosClient,
+            settings.Value.Databases["Orders"].DatabaseName,
+            settings.Value.Databases["Orders"].Containers["Orders"],
+            logger)
+    {
+    }
+
+    public async Task<IEnumerable<Order>> GetOrdersByUserIdAsync(string userId)
+    {
+        var queryDefinition = new QueryDefinition(
+            "SELECT * FROM c WHERE c.userId = @userId ORDER BY c.createdAt DESC")
+            .WithParameter("@userId", userId);
+
+        return await QueryAsync(queryDefinition);
+    }
+
+    public async Task<IEnumerable<Order>> GetOrdersByStatusAsync(string status)
+    {
+        var queryDefinition = new QueryDefinition(
+            "SELECT * FROM c WHERE c.status = @status")
+            .WithParameter("@status", status);
+
+        return await QueryAsync(queryDefinition);
+    }
+
+    public async Task<IEnumerable<Order>> GetOrdersByDateRangeAsync(DateTime startDate, DateTime endDate)
+    {
+        var queryDefinition = new QueryDefinition(
+            "SELECT * FROM c WHERE c.createdAt >= @startDate AND c.createdAt <= @endDate")
+            .WithParameter("@startDate", startDate)
+            .WithParameter("@endDate", endDate);
+
+        return await QueryAsync(queryDefinition);
+    }
+}
+
+
+// ============================================================
+// 6. PRODUCT REPOSITORY (ProductsDB)
+// ============================================================
+
+public interface IProductRepository : ICosmosRepository<Product>
+{
+    Task<IEnumerable<Product>> GetProductsByCategoryAsync(string category);
+    Task<Product?> GetProductBySkuAsync(string sku);
+    Task<IEnumerable<Product>> GetInStockProductsAsync();
+    Task<IEnumerable<Product>> SearchProductsAsync(string searchTerm);
+}
+
+public class ProductRepository : CosmosRepository<Product>, IProductRepository
+{
+    public ProductRepository(
+        CosmosClient cosmosClient,
+        IOptions<CosmosDbSettings> settings,
+        ILogger<ProductRepository> logger)
+        : base(
+            cosmosClient,
+            settings.Value.Databases["Products"].DatabaseName,
+            settings.Value.Databases["Products"].Containers["Products"],
+            logger)
+    {
+    }
+
+    public async Task<IEnumerable<Product>> GetProductsByCategoryAsync(string category)
+    {
+        var queryDefinition = new QueryDefinition(
+            "SELECT * FROM c WHERE c.category = @category")
+            .WithParameter("@category", category);
+
+        return await QueryAsync(queryDefinition);
+    }
+
+    public async Task<Product?> GetProductBySkuAsync(string sku)
+    {
+        var queryDefinition = new QueryDefinition(
+            "SELECT * FROM c WHERE c.sku = @sku")
+            .WithParameter("@sku", sku);
+
+        var results = await QueryAsync(queryDefinition);
+        return results.FirstOrDefault();
+    }
+
+    public async Task<IEnumerable<Product>> GetInStockProductsAsync()
+    {
+        var queryDefinition = new QueryDefinition(
+            "SELECT * FROM c WHERE c.inStock = true");
+
+        return await QueryAsync(queryDefinition);
+    }
+
+    public async Task<IEnumerable<Product>> SearchProductsAsync(string searchTerm)
+    {
+        var queryDefinition = new QueryDefinition(
+            "SELECT * FROM c WHERE CONTAINS(LOWER(c.name), @searchTerm) OR CONTAINS(LOWER(c.description), @searchTerm)")
+            .WithParameter("@searchTerm", searchTerm.ToLower());
+
+        return await QueryAsync(queryDefinition);
+    }
+}
+
+
+// ============================================================
+// 7. USER REPOSITORY (UsersDB)
+// ============================================================
+
+public interface IUserRepository : ICosmosRepository<User>
+{
+    Task<User?> GetUserByEmailAsync(string email);
+    Task<IEnumerable<User>> GetUsersByStatusAsync(string status);
+}
+
+public class UserRepository : CosmosRepository<User>, IUserRepository
+{
+    public UserRepository(
+        CosmosClient cosmosClient,
+        IOptions<CosmosDbSettings> settings,
+        ILogger<UserRepository> logger)
+        : base(
+            cosmosClient,
+            settings.Value.Databases["Users"].DatabaseName,
+            settings.Value.Databases["Users"].Containers["Users"],
+            logger)
+    {
+    }
+
+    public async Task<User?> GetUserByEmailAsync(string email)
+    {
+        var queryDefinition = new QueryDefinition(
+            "SELECT * FROM c WHERE c.email = @email")
+            .WithParameter("@email", email);
+
+        var results = await QueryAsync(queryDefinition);
+        return results.FirstOrDefault();
+    }
+
+    public async Task<IEnumerable<User>> GetUsersByStatusAsync(string status)
+    {
+        var queryDefinition = new QueryDefinition(
+            "SELECT * FROM c WHERE c.status = @status")
+            .WithParameter("@status", status);
+
+        return await QueryAsync(queryDefinition);
+    }
+}
+
+
+// ============================================================
+// 8. MULTI-CONTAINER SERVICE (ACCESS MULTIPLE CONTAINERS)
+// ============================================================
+
+public interface IOrderManagementService
+{
+    Task<OrderWithHistory> GetOrderWithHistoryAsync(string orderId);
+    Task AddOrderHistoryEntryAsync(string orderId, OrderHistoryEntry entry);
+}
+
+public class OrderManagementService : IOrderManagementService
+{
+    private readonly Container _ordersContainer;
+    private readonly Container _historyContainer;
+    private readonly ILogger<OrderManagementService> _logger;
+
+    public OrderManagementService(
+        CosmosClient cosmosClient,
+        IOptions<CosmosDbSettings> settings,
+        ILogger<OrderManagementService> logger)
+    {
+        var ordersDb = settings.Value.Databases["Orders"];
+        
+        _ordersContainer = cosmosClient.GetContainer(
+            ordersDb.DatabaseName,
+            ordersDb.Containers["Orders"]);
+        
+        _historyContainer = cosmosClient.GetContainer(
+            ordersDb.DatabaseName,
+            ordersDb.Containers["OrderHistory"]);
+        
+        _logger = logger;
+    }
+
+    public async Task<OrderWithHistory> GetOrderWithHistoryAsync(string orderId)
+    {
+        // Get order from orders container
+        var orderResponse = await _ordersContainer.ReadItemAsync<Order>(
+            orderId,
+            new PartitionKey(orderId));
+
+        // Query history from history container
+        var queryDefinition = new QueryDefinition(
+            "SELECT * FROM c WHERE c.orderId = @orderId ORDER BY c.timestamp DESC")
+            .WithParameter("@orderId", orderId);
+
+        var historyQuery = _historyContainer.GetItemQueryIterator<OrderHistoryEntry>(queryDefinition);
+        var history = new List<OrderHistoryEntry>();
+
+        while (historyQuery.HasMoreResults)
+        {
+            var response = await historyQuery.ReadNextAsync();
+            history.AddRange(response);
+        }
+
+        return new OrderWithHistory
+        {
+            Order = orderResponse.Resource,
+            History = history
+        };
+    }
+
+    public async Task AddOrderHistoryEntryAsync(string orderId, OrderHistoryEntry entry)
+    {
+        entry.OrderId = orderId;
+        entry.Timestamp = DateTime.UtcNow;
+        
+        await _historyContainer.CreateItemAsync(
+            entry,
+            new PartitionKey(orderId));
+    }
+}
+
+
+// ============================================================
+// 9. ENTITY MODELS
+// ============================================================
+
+public class Order
+{
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = Guid.NewGuid().ToString();
+
+    [JsonPropertyName("userId")]
+    public string UserId { get; set; } = string.Empty;
+
+    [JsonPropertyName("orderNumber")]
+    public string OrderNumber { get; set; } = string.Empty;
+
+    [JsonPropertyName("status")]
+    public string Status { get; set; } = "Pending";
+
+    [JsonPropertyName("totalAmount")]
+    public decimal TotalAmount { get; set; }
+
+    [JsonPropertyName("items")]
+    public List<OrderItem> Items { get; set; } = new();
+
+    [JsonPropertyName("createdAt")]
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+    [JsonPropertyName("updatedAt")]
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+
+    [JsonPropertyName("_etag")]
+    public string? ETag { get; set; }
+}
+
+public class OrderItem
+{
+    [JsonPropertyName("productId")]
+    public string ProductId { get; set; } = string.Empty;
+
+    [JsonPropertyName("productName")]
+    public string ProductName { get; set; } = string.Empty;
+
+    [JsonPropertyName("quantity")]
+    public int Quantity { get; set; }
+
+    [JsonPropertyName("price")]
+    public decimal Price { get; set; }
+}
+
+public class OrderHistoryEntry
+{
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = Guid.NewGuid().ToString();
+
+    [JsonPropertyName("orderId")]
+    public string OrderId { get; set; } = string.Empty;
+
+    [JsonPropertyName("action")]
+    public string Action { get; set; } = string.Empty;
+
+    [JsonPropertyName("description")]
+    public string Description { get; set; } = string.Empty;
+
+    [JsonPropertyName("timestamp")]
+    public DateTime Timestamp { get; set; } = DateTime.UtcNow;
+
+    [JsonPropertyName("performedBy")]
+    public string PerformedBy { get; set; } = string.Empty;
+}
+
+public class Product
+{
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = Guid.NewGuid().ToString();
+
+    [JsonPropertyName("sku")]
+    public string Sku { get; set; } = string.Empty;
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = string.Empty;
+
+    [JsonPropertyName("description")]
+    public string Description { get; set; } = string.Empty;
+
+    [JsonPropertyName("category")]
+    public string Category { get; set; } = string.Empty;
+
+    [JsonPropertyName("price")]
+    public decimal Price { get; set; }
+
+    [JsonPropertyName("inStock")]
+    public bool InStock { get; set; }
+
+    [JsonPropertyName("createdAt")]
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+}
+
+public class User
+{
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = Guid.NewGuid().ToString();
+
+    [JsonPropertyName("email")]
+    public string Email { get; set; } = string.Empty;
+
+    [JsonPropertyName("firstName")]
+    public string FirstName { get; set; } = string.Empty;
+
+    [JsonPropertyName("lastName")]
+    public string LastName { get; set; } = string.Empty;
+
+    [JsonPropertyName("status")]
+    public string Status { get; set; } = "Active";
+
+    [JsonPropertyName("createdAt")]
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+}
+
+public class OrderWithHistory
+{
+    public Order Order { get; set; } = new();
+    public List<OrderHistoryEntry> History { get; set; } = new();
+}
+
+
+// ============================================================
+// 10. EXTENSION METHOD FOR CLEAN REGISTRATION
+// ============================================================
+
+public static class CosmosDbServiceCollectionExtensions
+{
+    public static IServiceCollection AddCosmosDb(
+        this IServiceCollection services,
+        IConfiguration configuration)
+    {
+        // Register settings
+        services.Configure<CosmosDbSettings>(
+            configuration.GetSection("CosmosDb"));
+
+        // Register CosmosClient as Singleton
+        services.AddSingleton<CosmosClient>(serviceProvider =>
+        {
+            var settings = configuration.GetSection("CosmosDb").Get<CosmosDbSettings>();
+            
+            if (settings == null)
+                throw new InvalidOperationException("CosmosDB settings not found in configuration");
+
+            return new CosmosClient(
+                settings.Account,
+                settings.Key,
+                new CosmosClientOptions
+                {
+                    SerializerOptions = new CosmosSerializationOptions
+                    {
+                        PropertyNamingPolicy = CosmosPropertyNamingPolicy.CamelCase
+                    },
+                    ConnectionMode = ConnectionMode.Direct,
+                    MaxRetryAttemptsOnRateLimitedRequests = 3,
+                    MaxRetryWaitTimeOnRateLimitedRequests = TimeSpan.FromSeconds(10),
+                    ApplicationName = "MyWebAPI",
+                    RequestTimeout = TimeSpan.FromSeconds(30)
+                });
+        });
+
+        // Register repositories
+        services.AddScoped<IOrderRepository, OrderRepository>();
+        services.AddScoped<IProductRepository, ProductRepository>();
+        services.AddScoped<IUserRepository, UserRepository>();
+        
+        // Register multi-container services
+        services.AddScoped<IOrderManagementService, OrderManagementService>();
+
+        return services;
+    }
+}
+
+
+// ============================================================
+// 11. COMPLETE MINIMAL API EXAMPLE WITH COSMOS DB
+// ============================================================
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Add services
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+builder.Services.AddCosmosDb(builder.Configuration);
+
+var app = builder.Build();
+
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+app.UseHttpsRedirection();
+
+// ===== ORDERS ENDPOINTS (OrdersDB) =====
+app.MapGet("/api/orders/{id}", async (string id, IOrderRepository orderRepo) =>
+{
+    var order = await orderRepo.GetByIdAsync(id, id);
+    return order is not null ? Results.Ok(order) : Results.NotFound();
+})
+.WithName("GetOrder")
+.WithTags("Orders");
+
+app.MapGet("/api/orders/user/{userId}", async (string userId, IOrderRepository orderRepo) =>
+{
+    var orders = await orderRepo.GetOrdersByUserIdAsync(userId);
+    return Results.Ok(orders);
+})
+.WithName("GetOrdersByUser")
+.WithTags("Orders");
+
+app.MapGet("/api/orders/status/{status}", async (string status, IOrderRepository orderRepo) =>
+{
+    var orders = await orderRepo.GetOrdersByStatusAsync(status);
+    return Results.Ok(orders);
+})
+.WithName("GetOrdersByStatus")
+.WithTags("Orders");
+
+app.MapPost("/api/orders", async (Order order, IOrderRepository orderRepo) =>
+{
+    var created = await orderRepo.CreateAsync(order, order.UserId);
+    return Results.Created($"/api/orders/{created.Id}", created);
+})
+.WithName("CreateOrder")
+.WithTags("Orders");
+
+app.MapPut("/api/orders/{id}", async (string id, Order order, IOrderRepository orderRepo) =>
+{
+    order.Id = id;
+    order.UpdatedAt = DateTime.UtcNow;
+    var updated = await orderRepo.UpdateAsync(id, order, order.UserId);
+    return Results.Ok(updated);
+})
+.WithName("UpdateOrder")
+.WithTags("Orders");
+
+app.MapDelete("/api/orders/{id}", async (string id, string userId, IOrderRepository orderRepo) =>
+{
+    await orderRepo.DeleteAsync(id, userId);
+    return Results.NoContent();
+})
+.WithName("DeleteOrder")
+.WithTags("Orders");
+
+// ===== PRODUCTS ENDPOINTS (ProductsDB) =====
+app.MapGet("/api/products/{id}", async (string id, IProductRepository productRepo) =>
+{
+    var product = await productRepo.GetByIdAsync(id, id);
+    return product is not null ? Results.Ok(product) : Results.NotFound();
+})
+.WithName("GetProduct")
+.WithTags("Products");
+
+app.MapGet("/api/products/category/{category}", async (string category, IProductRepository productRepo) =>
+{
+    var products = await productRepo.GetProductsByCategoryAsync(category);
+    return Results.Ok(products);
+})
+.WithName("GetProductsByCategory")
+.WithTags("Products");
+
+app.MapGet("/api/products/search/{searchTerm}", async (string searchTerm, IProductRepository productRepo) =>
+{
+    var products = await productRepo.SearchProductsAsync(searchTerm);
+    return Results.Ok(products);
+})
+.WithName("SearchProducts")
+.WithTags("Products");
+
+app.MapPost("/api/products", async (Product product, IProductRepository productRepo) =>
+{
+    var created = await productRepo.CreateAsync(product, product.Category);
+    return Results.Created($"/api/products/{created.Id}", created);
+})
+.WithName("CreateProduct")
+.WithTags("Products");
+
+// ===== USERS ENDPOINTS (UsersDB) =====
+app.MapGet("/api/users/{id}", async (string id, IUserRepository userRepo) =>
+{
+    var user = await userRepo.GetByIdAsync(id, id);
+    return user is not null ? Results.Ok(user) : Results.NotFound();
+})
+.WithName("GetUser")
+.WithTags("Users");
+
+app.MapGet("/api/users/email/{email}", async (string email, IUserRepository userRepo) =>
+{
+    var user = await userRepo.GetUserByEmailAsync(email);
+    return user is not null ? Results.Ok(user) : Results.NotFound();
+})
+.WithName("GetUserByEmail")
+.WithTags("Users");
+
+app.MapPost("/api/users", async (User user, IUserRepository userRepo) =>
+{
+    var created = await userRepo.CreateAsync(user, user.Email);
+    return Results.Created($"/api/users/{created.Id}", created);
+})
+.WithName("CreateUser")
+.WithTags("Users");
+
+// ===== MULTI-CONTAINER ENDPOINT =====
+app.MapGet("/api/orders/{id}/with-history", async (string id, IOrderManagementService orderMgmtService) =>
+{
+    var orderWithHistory = await orderMgmtService.GetOrderWithHistoryAsync(id);
+    return Results.Ok(orderWithHistory);
+})
+.WithName("GetOrderWithHistory")
+.WithTags("Orders");
+
+app.Run();
+
+
+// ============================================================
+// 12. BATCH OPERATIONS
+// ============================================================
+
+public class CosmosDbBatchService
+{
+    private readonly Container _container;
+    private readonly ILogger<CosmosDbBatchService> _logger;
+
+    public CosmosDbBatchService(
+        Container container,
+        ILogger<CosmosDbBatchService> logger)
+    {
+        _container = container;
+        _logger = logger;
+    }
+
+    public async Task<bool> BatchCreateOrdersAsync(List<Order> orders, string partitionKey)
+    {
+        var batch = _container.CreateTransactionalBatch(new PartitionKey(partitionKey));
+
+        foreach (var order in orders)
+        {
+            batch.CreateItem(order);
+        }
+
+        using var response = await batch.ExecuteAsync();
+        
+        if (response.IsSuccessStatusCode)
+        {
+            _logger.LogInformation("Batch created {Count} orders, RU: {RU}", 
+                orders.Count, response.RequestCharge);
+        }
+        else
+        {
+            _logger.LogError("Batch operation failed with status: {Status}", response.StatusCode);
+        }
+
+        return response.IsSuccessStatusCode;
+    }
+
+    public async Task<bool> BatchUpdateAndDeleteAsync(
+        Order orderToUpdate, 
+        string orderIdToDelete, 
+        string partitionKey)
+    {
+        var batch = _container.CreateTransactionalBatch(new PartitionKey(partitionKey));
+
+        batch.ReplaceItem(orderToUpdate.Id, orderToUpdate);
+        batch.DeleteItem(orderIdToDelete);
+
+        using var response = await batch.ExecuteAsync();
+        return response.IsSuccessStatusCode;
+    }
+}
+
+
+// ============================================================
+// 13. CHANGE FEED PROCESSOR (FOR REAL-TIME PROCESSING)
+// ============================================================
+
+public class OrderChangeFeedProcessor : BackgroundService
+{
+    private readonly CosmosClient _cosmosClient;
+    private readonly ILogger<OrderChangeFeedProcessor> _logger;
+    private readonly string _databaseName;
+    private readonly string _containerName;
+    private readonly string _leaseContainerName;
+    private ChangeFeedProcessor? _changeFeedProcessor;
+
+    public OrderChangeFeedProcessor(
+        CosmosClient cosmosClient,
+        IOptions<CosmosDbSettings> settings,
+        ILogger<OrderChangeFeedProcessor> logger)
+    {
+        _cosmosClient = cosmosClient;
+        _logger = logger;
+        _databaseName = settings.Value.Databases["Orders"].DatabaseName;
+        _containerName = settings.Value.Databases["Orders"].Containers["Orders"];
+        _leaseContainerName = "leases"; // Create this container with /id as partition key
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        var container = _cosmosClient.GetContainer(_databaseName, _containerName);
+        var leaseContainer = _cosmosClient.GetContainer(_databaseName, _leaseContainerName);
+
+        _changeFeedProcessor = container
+            .GetChangeFeedProcessorBuilder<Order>("orderProcessor", HandleChangesAsync)
+            .WithInstanceName("instance1")
+            .WithLeaseContainer(leaseContainer)
+            .WithStartTime(DateTime.UtcNow.AddHours(-1))
+            .WithPollInterval(TimeSpan.FromSeconds(5))
+            .Build();
+
+        await _changeFeedProcessor.StartAsync();
+        _logger.LogInformation("Change Feed Processor started for {Database}/{Container}", 
+            _databaseName, _containerName);
+
+        // Keep running until cancellation
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken);
+        }
+
+        await _changeFeedProcessor.StopAsync();
+        _logger.LogInformation("Change Feed Processor stopped");
+    }
+
+    private async Task HandleChangesAsync(
+        ChangeFeedProcessorContext context,
+        IReadOnlyCollection<Order> changes,
+        CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("Processing {Count} order changes", changes.Count);
+
+        foreach (var order in changes)
+        {
+            _logger.LogInformation("Order {OrderId} changed - Status: {Status}, Total: {Total}", 
+                order.Id, order.Status, order.TotalAmount);
+            
+            // Process the change
+            await ProcessOrderChangeAsync(order, cancellationToken);
+        }
+    }
+
+    private async Task ProcessOrderChangeAsync(Order order, CancellationToken cancellationToken)
+    {
+        // Example: Send notification, update analytics, trigger workflow, etc.
+        if (order.Status == "Completed")
+        {
+            _logger.LogInformation("Order {OrderId} completed - trigger shipping notification", order.Id);
+            // Send notification logic here
+        }
+
+        await Task.CompletedTask;
+    }
+}
+
+// Register in Program.cs
+builder.Services.AddHostedService<OrderChangeFeedProcessor>();
+
+
+// ============================================================
+// 14. PAGINATION HELPER
+// ============================================================
+
+public class PaginationHelper
+{
+    public static async Task<(List<T> items, string? continuationToken)> GetPagedResultsAsync<T>(
+        Container container,
+        QueryDefinition queryDefinition,
+        string? continuationToken,
+        int pageSize = 10)
+    {
+        var queryRequestOptions = new QueryRequestOptions
+        {
+            MaxItemCount = pageSize
+        };
+
+        var query = container.GetItemQueryIterator<T>(
+            queryDefinition,
+            continuationToken,
+            queryRequestOptions);
+
+        var results = new List<T>();
+
+        if (query.HasMoreResults)
+        {
+            var response = await query.ReadNextAsync();
+            results.AddRange(response);
+            return (results, response.ContinuationToken);
+        }
+
+        return (results, null);
+    }
+}
+
+// Usage in API endpoint
+app.MapGet("/api/orders/paged", async (
+    [FromQuery] string? continuationToken,
+    [FromQuery] int pageSize,
+    IOrderRepository orderRepo) =>
+{
+    var container = orderRepo._container; // Expose container if needed
+    var queryDefinition = new QueryDefinition("SELECT * FROM c ORDER BY c.createdAt DESC");
+    
+    var (orders, nextToken) = await PaginationHelper.GetPagedResultsAsync<Order>(
+        container, 
+        queryDefinition, 
+        continuationToken, 
+        pageSize);
+
+    return Results.Ok(new 
+    { 
+        data = orders, 
+        continuationToken = nextToken,
+        hasMore = !string.IsNullOrEmpty(nextToken)
+    });
+});
